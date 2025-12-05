@@ -1,15 +1,25 @@
 {
-  "name": "vibe-kanban",
+  "name": "vibe-kanban-nb",
   "private": false,
   "version": "0.0.129",
   "main": "index.js",
   "bin": {
-    "vibe-kanban": "bin/cli.js"
+    "vibe-kanban-nb": "bin/cli.js"
   },
-  "keywords": [],
-  "author": "bloop",
-  "license": "",
-  "description": "NPX wrapper around vibe-kanban and vibe-kanban-mcp",
+  "keywords": [
+    "vibe-kanban",
+    "kanban",
+    "ai-coding",
+    "coding-agents"
+  ],
+  "author": "butterlyn",
+  "license": "Apache-2.0",
+  "description": "Personal fork of vibe-kanban - NPX wrapper around vibe-kanban and vibe-kanban-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/butterlyn/vibe-kanban.git"
+  },
+  "homepage": "https://github.com/butterlyn/vibe-kanban#readme",
   "dependencies": {
     "adm-zip": "^0.5.16"
   },

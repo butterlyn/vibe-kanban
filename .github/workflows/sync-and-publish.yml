@@ -1,0 +1,205 @@
+name: Sync Fork and Publish
+
+on:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: 'Force publish even if versions match'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/BloopAI/vibe-kanban.git || true
+          git fetch upstream --tags
+
+      - name: Get upstream latest release
+        id: upstream
+        run: |
+          # Get the latest stable release tag from upstream
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No stable release tags found"
+            echo "has_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract version without 'v' prefix
+          UPSTREAM_VERSION="${LATEST_TAG#v}"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "has_release=true" >> $GITHUB_OUTPUT
+          echo "Found upstream release: $LATEST_TAG (version $UPSTREAM_VERSION)"
+
+      - name: Get current fork version
+        id: current
+        if: steps.upstream.outputs.has_release == 'true'
+        run: |
+          CURRENT_VERSION=$(jq -r '.version' npx-cli/package.json)
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current fork version: $CURRENT_VERSION"
+
+      - name: Check if update needed
+        id: check
+        if: steps.upstream.outputs.has_release == 'true'
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.version }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          FORCE="${{ inputs.force_publish }}"
+
+          if [ "$FORCE" == "true" ]; then
+            echo "Force publish enabled"
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+          elif [ "$UPSTREAM" != "$CURRENT" ]; then
+            echo "Version mismatch: upstream=$UPSTREAM, current=$CURRENT"
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+          else
+            echo "Versions match, no update needed"
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.should_publish == 'true'
+        run: |
+          # Merge the upstream tag
+          git merge ${{ steps.upstream.outputs.tag }} --no-edit -X theirs || {
+            # If merge fails, try to resolve conflicts by keeping our customizations
+            echo "Merge conflict detected, attempting auto-resolution..."
+
+            # Keep our package.json customizations
+            git checkout --ours npx-cli/package.json
+            git add npx-cli/package.json
+
+            # Keep our workflows
+            git checkout --ours .github/workflows/ || true
+            git add .github/workflows/ || true
+
+            git commit -m "Merge upstream ${{ steps.upstream.outputs.tag }} with conflict resolution"
+          }
+
+      - name: Update package version
+        if: steps.check.outputs.should_publish == 'true'
+        run: |
+          cd npx-cli
+
+          # Update version to match upstream
+          jq --arg v "${{ steps.upstream.outputs.version }}" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          # Ensure our customizations are preserved
+          jq '.name = "vibe-kanban-nb" | .bin = {"vibe-kanban-nb": "bin/cli.js"} | .author = "butterlyn"' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          echo "Updated package.json:"
+          cat package.json
+
+      - name: Download upstream package
+        if: steps.check.outputs.should_publish == 'true'
+        run: |
+          # Download the pre-built package from upstream npm
+          npm pack vibe-kanban@${{ steps.upstream.outputs.version }}
+
+          # Extract it
+          mkdir -p upstream-pkg
+          tar -xzf vibe-kanban-${{ steps.upstream.outputs.version }}.tgz -C upstream-pkg
+
+          echo "Downloaded and extracted upstream package"
+          ls -la upstream-pkg/package/
+
+      - name: Repackage for vibe-kanban-nb
+        if: steps.check.outputs.should_publish == 'true'
+        run: |
+          cd upstream-pkg/package
+
+          # Update package.json with our customizations
+          jq '.name = "vibe-kanban-nb" | .bin = {"vibe-kanban-nb": "bin/cli.js"} | .author = "butterlyn" | .repository.url = "https://github.com/butterlyn/vibe-kanban.git" | .homepage = "https://github.com/butterlyn/vibe-kanban#readme"' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          # Update description
+          jq '.description = "Personal fork of vibe-kanban - NPX wrapper around vibe-kanban and vibe-kanban-mcp"' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+          echo "Repackaged package.json:"
+          cat package.json
+
+          # Create the new package
+          npm pack
+          mv *.tgz ../../vibe-kanban-nb-${{ steps.upstream.outputs.version }}.tgz
+
+          cd ../..
+          echo "Created package:"
+          ls -la *.tgz
+
+      - name: Publish to npm
+        if: steps.check.outputs.should_publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish vibe-kanban-nb-${{ steps.upstream.outputs.version }}.tgz --access public
+
+      - name: Commit version update
+        if: steps.check.outputs.should_publish == 'true'
+        run: |
+          git add npx-cli/package.json
+          git commit -m "chore: sync with upstream v${{ steps.upstream.outputs.version }}" || echo "No changes to commit"
+          git push origin main
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.should_publish == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.upstream.outputs.version }}
+          name: v${{ steps.upstream.outputs.version }}
+          body: |
+            Synced with upstream [BloopAI/vibe-kanban v${{ steps.upstream.outputs.version }}](https://github.com/BloopAI/vibe-kanban/releases/tag/v${{ steps.upstream.outputs.version }})
+
+            Install with:
+            ```bash
+            npx vibe-kanban-nb
+            ```
+          files: |
+            vibe-kanban-nb-${{ steps.upstream.outputs.version }}.tgz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.should_publish }}" == "true" ]; then
+            echo "## Published vibe-kanban-nb@${{ steps.upstream.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Install with: \`npx vibe-kanban-nb\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## No update needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Current version: ${{ steps.current.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "Upstream version: ${{ steps.upstream.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          fi
